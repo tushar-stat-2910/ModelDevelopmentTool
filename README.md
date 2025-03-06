@@ -1,40 +1,25 @@
-import os
+from django.shortcuts import render
 import pandas as pd
-from django.http import JsonResponse
-from django.views.decorators.csrf import csrf_exempt
 
-# Define a global variable to store uploaded data
-InputData = None
+def DataExploration(request):
+    global InputData
 
-@csrf_exempt
-def FileUpload(request):
-    global InputData  # Use global variable to store data in memory
+    if InputData is None:
+        return render(request, "App/DataExploration.html", {"summary": None, "error": "No data uploaded yet."})
 
-    if request.method == "POST" and request.FILES.get("file"):
-        uploaded_file = request.FILES["file"]
+    try:
+        # Compute column-wise summary
+        summary = pd.DataFrame({
+            "Column Name": InputData.columns,
+            "Data Type": InputData.dtypes.values,
+            "Missing Values": InputData.isnull().sum().values,
+            "Unique Values": InputData.nunique().values
+        })
 
-        # Ensure upload directory exists
-        upload_dir = "media/uploads/"
-        os.makedirs(upload_dir, exist_ok=True)
-        
-        # Define file save path
-        save_path = os.path.join(upload_dir, uploaded_file.name)
+        # Convert DataFrame to a list of dictionaries for easy rendering in Django
+        summary_data = summary.to_dict(orient="records")
 
-        try:
-            # Save file to disk
-            with open(save_path, "wb+") as destination:
-                for chunk in uploaded_file.chunks():
-                    destination.write(chunk)
+        return render(request, "App/DataExploration.html", {"summary": summary_data})
 
-            # Load file into memory as DataFrame
-            if save_path.endswith(".csv"):
-                InputData = pd.read_csv(save_path)
-            else:
-                InputData = pd.read_excel(save_path)
-
-            return JsonResponse({"success": True})
-
-        except Exception as e:
-            return JsonResponse({"success": False, "error": str(e)})
-
-    return JsonResponse({"success": False, "error": "No file uploaded."})
+    except Exception as e:
+        return render(request, "App/DataExploration.html", {"summary": None, "error": str(e)})
