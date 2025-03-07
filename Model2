@@ -326,3 +326,65 @@ def printToFile(text):
     f.close()
     
 uploadStyle = {'width': '100%','height': '60px','lineHeight': '60px','borderWidth': '1px','borderStyle': 'dashed','borderRadius': '5px','textAlign': 'center','margin': '10px'}
+##########################################################################
+Preprocess
+
+
+import pandas as pd
+import numpy as np
+
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+
+
+
+def Preprocess(settings_dict, df):
+
+    imp_dict = pd.Series(settings_dict['imp_dict'])
+    blankFillWithMean_features = list(imp_dict.loc[imp_dict == "mean"].index)
+    blankFillWithMedian_features = list(imp_dict.loc[imp_dict == "median"].index)
+    blankFillWithMode_features = list(imp_dict.loc[imp_dict == "mode"].index)
+    blankIsBlank_features = list(imp_dict.loc[imp_dict == "BLANK"].index)
+    blankIsZero_features = list(imp_dict.loc[imp_dict == 0].index)
+
+    imputation_list_num =   [('blankIsZero', SimpleImputer(missing_values=np.nan, strategy='constant', fill_value = 0), blankIsZero_features),
+                             ('blankFillWithMean', SimpleImputer(missing_values=np.nan, strategy='mean'), blankFillWithMean_features),
+                             ('blankFillWithMedian', SimpleImputer(missing_values=np.nan, strategy='median'), blankFillWithMedian_features)]
+
+    imputation_list_cat =   [('blankIsBlank', SimpleImputer(missing_values=np.nan, strategy='constant', fill_value = 'blank'), blankIsBlank_features),
+                             ('blankFillWithMode', SimpleImputer(missing_values=np.nan, strategy='most_frequent'), blankFillWithMode_features),
+                           ]
+
+    numeric_features = []
+    for x in imputation_list_num:
+        for y in (x[2]):
+            numeric_features.append(y)
+
+    categorical_features = []
+    for x in imputation_list_cat:
+        for y in (x[2]):
+            categorical_features.append(y)
+
+
+    imp_num = ColumnTransformer(imputation_list_num,remainder='drop')
+    imp_cat = ColumnTransformer(imputation_list_cat,remainder='drop')
+
+    numeric_transformer = Pipeline(steps = [('imp_num', imp_num),
+                                #('reconstructionToPandasDataFrame1', pandasDataFrameReconstruction(columns= numericalCols)),
+                                ('scaler', StandardScaler())
+                               ])
+
+    categorical_transformer = Pipeline(steps = [('imp_cat', imp_cat),
+                                #('reconstructionToPandasDataFrame2', pandasDataFrameReconstruction(columns= catCols)),
+                                ('ohe',OneHotEncoder(handle_unknown='ignore', sparse= False))
+                               ])
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numeric_transformer, numeric_features),
+            ('cat', categorical_transformer, categorical_features),
+            ],
+        remainder='drop')
+     
+    return preprocessor.fit_transform(df)
