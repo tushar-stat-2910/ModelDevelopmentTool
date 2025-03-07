@@ -262,8 +262,40 @@ app.layout = html.Div(
 if __name__ == "__main__":
     app.run_server(debug=True)
 ###################################################################################################################
-func.py
+funcs.py
 
+
+import base64
+import io
+import pandas as pd
+
+
+
+def parse_contents(contents, filename):
+    content_type, content_string = contents.split(',')
+
+    decoded = base64.b64decode(content_string)
+    try:
+        if 'csv' in filename:
+            # Assume that the user uploaded a CSV file
+            df = pd.read_csv(
+                io.StringIO(decoded.decode('utf-8')))
+        elif 'xls' in filename:
+            # Assume that the user uploaded an excel file
+            df = pd.read_excel(io.BytesIO(decoded))
+    except Exception as e:
+        df = pd.DataFrame()
+    return df
+
+
+def printToFile(text):
+    f = open("demofile2.txt", "a")
+    f.write(text+"\n")
+    f.close()
+    
+uploadStyle = {'width': '100%','height': '60px','lineHeight': '60px','borderWidth': '1px','borderStyle': 'dashed','borderRadius': '5px','textAlign': 'center','margin': '10px'}
+
+#########################################################################3
 
 import base64
 import io
