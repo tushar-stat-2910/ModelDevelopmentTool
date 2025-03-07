@@ -1,0 +1,1018 @@
+dashApp.py
+#######################################
+import dash
+import dash_table
+from dash_table.Format import Format, Scheme
+import dash_html_components as html
+import dash_core_components as dcc
+import dash_bootstrap_components as dbc
+import dash_daq as daq
+from flask import Flask, send_from_directory
+import json
+import os
+from dash.dependencies import Input, Output, State
+from dash.exceptions import PreventUpdate
+
+import logging
+logging.basicConfig(filename="modelfile.log", level=logging.INFO)
+
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import pickle as pkl
+import ast
+from pandas.api.types import is_numeric_dtype
+from io import BytesIO
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import confusion_matrix, classification_report, roc_curve, roc_auc_score
+
+from funcs import *
+from Hyperparameter import *
+from AutoML import *
+from style import *
+
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+app.config['suppress_callback_exceptions'] = True
+
+trained_clfs = {}
+
+def fileViewerComp():
+    return html.Div([
+        dcc.Upload(id='upload-data', children=html.Div(['Drag and Drop or ', html.A('Select Files')]),
+                   style=uploadStyle, multiple=False),
+        dash_table.DataTable(id='upload-data-table',
+                             columns=None,
+                             data=None,
+                             persistence=True)
+    ])
+
+@app.callback(Output('upload-data-table', 'data'),
+              Output('upload-data-table', 'columns'),
+              Output('file-viewer-memory', 'data'),
+              Input('upload-data', 'contents'),
+              State('upload-data', 'filename')
+              )
+def file_upload_callback(contents, filename):
+    if contents is not None:
+        all_data = parse_contents(contents, filename)
+    else:
+        all_data = pd.DataFrame()
+    return all_data.to_dict('records'), [{"name": i, "id": i, "type": "numeric", "format": Format(precision=2, scheme=Scheme.fixed)} for i in all_data.columns], {'all_data': all_data.to_dict('records')}
+
+def hyperParamComp():
+    columns = [{"name": i, "id": i} for i in [
+        'column name', 'Data type', 'Encoding', 'InputOrTarget', 'Imputation']]
+    hypCols = [{"name": i, "id": i} for i in ['Classifier','Actual argument','List of values to try']]
+    return html.Div(["Select the split for validation data :",
+                    dcc.Slider(id='test-train-slider',
+                               min=50,
+                               max=90,
+                               value = 80,
+                               step=10,
+                               marks={50: '50%', 60: '60%', 60: '60%', 70: '70%', 80: '80%', 90: '90%'},
+                               persistence=True),
+                    html.H3('Descriptive statistics'),
+                    dash_table.DataTable(id='descriptive-stats-table',
+                                         columns=None,
+                                         data=None,
+                                         persistence=True),
+                    html.H3('Column settings'),
+                    dash_table.DataTable(id='column-data',
+                                         columns=columns,
+                                         data=None,
+                                         editable=True,
+                                         style_data_conditional = style_data_conditional,
+                                         tooltip_delay=0,
+                                         tooltip_duration=None),
+                    html.H3('Hyperparameters'),
+                    dash_table.DataTable(id='hyper-parameter-table',
+                                         columns=hypCols,
+                                         data=None,
+                                         editable=True,
+                                         style_data_conditional = style_data_conditional,
+                                         tooltip_delay=0,
+                                         tooltip_duration=None)
+                ])
+
+# Call back triggered when settings of Hyperparameters is changed
+@app.callback(Output('hyper-param-memory', 'data'),
+              Output('column-data', 'data'),
+              Output('descriptive-stats-table', 'data'),
+              Output('descriptive-stats-table', 'columns'),
+              Output('hyper-parameter-table', 'data'),
+              Input('column-data', 'data'),
+              Input('hyper-parameter-table', 'data'),
+              Input('test-train-slider', 'value'),
+              State('hyper-param-memory', 'data'),
+              State('file-viewer-memory', 'data'))
+def hyperParamCallback(columnData, hyper_param_table, test_train_slider, hyper_param_memory, file_viewer_memory):
+    if hyper_param_memory is None:
+        df = pd.DataFrame(file_viewer_memory['all_data'])
+        colData = pd.DataFrame()
+        def func(df, x):
+            return 'Numerical data type' if is_numeric_dtype(df[x]) else f"Categorical data type with {len(df[x].unique())} categories"
+        colData['column name'] = df.columns
+        colData['Data type'] = [func(df, col) for col in df.columns]
+        colData['Encoding'] = ['NA' if x == "Numerical data type" else 'One hot encoding' for x in colData['Data type']]
+        colData['InputOrTarget'] = "Input"
+        colData["InputOrTarget"].iloc[colData.shape[0]-1] = "Target"
+        colData["Imputation"] = np.where(colData['Data type'] == "Numerical data type", "mean", "mode")
+        cat_cols = list(colData[(colData['Data type'] != 'Numerical data type') & (colData['InputOrTarget'] == 'Input')]['column name'])
+
+        for col in cat_cols:
+            le = LabelEncoder()
+            df[col] = le.fit_transform(df[col])
+        
+        hyper_param_memory = {'col_data': colData.to_dict('records'),
+                              'hyper_param_table': HyperParameters,
+                              'binnedDatasetSlider': 70,
+                              'dataframe': df.to_dict('records')}
+    else:
+        df      = pd.DataFrame(hyper_param_memory['dataframe'])
+        colData = pd.DataFrame(hyper_param_memory['col_data'])
+    train, test = train_test_split(df, test_size=(1 - test_train_slider/100))
+    hyper_param_memory['train'] = train.to_dict('records')
+    hyper_param_memory['test'] = test.to_dict('records')
+    df_train = pd.DataFrame(hyper_param_memory['train']) if hyper_param_memory is not None else pd.DataFrame()
+    # Calculating descriptive stats
+    df_desc_stats = df_train.describe().reset_index()
+    df_desc_stats_cols = [{"name": i, "id": i, "type": "numeric", "format": Format(precision=2, scheme=Scheme.fixed)} for i in df_desc_stats.columns]
+
+    # Calculating IV on train data
+    # IV is calculated once and stored into memory
+    iv_df = []
+    for col in df_train.columns:
+        if (col == 'y_'):
+            continue
+        else:
+            try:
+                if (colData.loc[colData["column name"] == col, "Data type"].values[0] == "Numerical data type"):
+                    df_train[col] = pd.cut(df_train[col], 5)
+                df, iv = calculate_woe_iv(df_train, col, 'y_')
+                iv_df.append([col, df["WoE"].sum(), df["IV"].sum()])
+            except:
+                pass
+    iv_df = pd.DataFrame(iv_df, columns=['Column', 'WoE', 'IV']).sort_values(by=['IV'], ascending=False)
+    hyper_param_memory['iv_df'] = iv_df.to_dict('records')
+
+    # Calculating correlation on train data
+    # Correlation calculation is done once and stored into the memory
+    df_train_corr = pd.DataFrame(hyper_param_memory['train']) if hyper_param_memory is not None else pd.DataFrame()
+    cor_matrix = df_train_corr.drop(["y_"], axis=1).corr().abs()
+    upper_tri = cor_matrix.where(np.triu(np.ones(cor_matrix.shape), k=1).astype(bool)).reset_index()
+    hyper_param_memory['corr_df'] = upper_tri.to_dict('records')
+
+    # First time setting the value of column data into memory.
+    if columnData is None:
+        columnData = hyper_param_memory['col_data']
+    else:
+        hyper_param_memory['col_data'] = columnData
+    # First time setting the value of hyperparameters data into memory.
+    if hyper_param_table is None:
+        hyper_param_table = hyper_param_memory['hyper_param_table']
+    else:
+        hyper_param_memory['hyper_param_table'] = hyper_param_table
+    return hyper_param_memory, columnData, df_desc_stats.to_dict('records'), df_desc_stats_cols, hyper_param_table
+
+def ivComp():
+    iv_df_cols = [{"name": i, "id": i, "type": "numeric", "format": Format(precision=2, scheme=Scheme.fixed)} for i in ['Column', 'WoE', 'IV']]
+    return html.Div([
+            html.Div([html.H5("Select the cutoff of Information value for variable elimination"),
+                      dcc.Dropdown(id='iv-cutoff-dropdown',
+                                   options=[{'label': str(round(x, 2)), 'value': round(x, 2)} for x in np.arange(0.0, 2.0, 0.01)],
+                                   value=0,
+                                   persistence=True)
+                     ],
+                     className="six columns",
+                     style=sideColStyle),
+            html.Div([html.H5("Column wise Weight of evidence and Information Value :"),
+                      dash_table.DataTable(id='iv-data-table',
+                                           columns=iv_df_cols,
+                                           data=None)
+                     ],
+                     className="six columns"),
+            ], className="row")
+
+# Call back triggered when anything is changed in information value tab is changed
+@app.callback(Output('information-value-memory', 'data'),
+              Output('iv-data-table', 'data'),
+              Input('iv-cutoff-dropdown', 'value'),
+              State('information-value-memory', 'data'),
+              State('hyper-param-memory', 'data'))
+def informationValueCallback(iv_cutoff_dropdown, iv_memory, hyper_param_memory):
+    iv_memory = iv_memory or {'iv-cutoff-value': 0.5}
+    iv_memory['iv-cutoff-value'] = iv_cutoff_dropdown
+    iv_df = pd.DataFrame(hyper_param_memory['iv_df'])
+    columns_to_drop = iv_df.loc[iv_df['IV'] <
+                                  iv_cutoff_dropdown]['Column'].values
+    iv_df = iv_df.loc[iv_df['IV'] >= iv_cutoff_dropdown].to_dict('records')
+    iv_memory['Columns dropped based on IV'] = columns_to_drop
+    iv_memory['filtered iv data'] = iv_df
+    return iv_memory, iv_df
+
+
+def corrComp():
+    return html.Div([
+        html.Div([html.H5("Select the cutoff of Correlation for variable elimination "),
+                  dcc.Dropdown(id='corr-cutoff-dropdown', options=[{'label': str(round(x, 2)), 'value': round(
+                      x, 2)} for x in np.arange(0.0, 1.1, 0.1)], value=1, persistence=True)
+                  ], className="six columns", style=sideColStyle),
+        html.Div([
+            dash_table.DataTable(id='corr-data-table',
+                                 columns=None, data=None),
+            html.H5(
+                "The following columns are dropped based on IV and correlation"),
+            dash_table.DataTable(
+                id='dropped-cols', columns=[{"name": i, "id": i} for i in ['S.No', 'Filtered columns']], data=None)
+        ], className="six columns"),
+    ], className="row")
+
+# Call back triggered when anything is changed in correlation test tab is changed
+@app.callback(Output('correlation-test-memory', 'data'),
+              Output('corr-data-table', 'data'),
+              Output('corr-data-table', 'columns'),
+              Output('dropped-cols', 'data'),
+              Input('corr-cutoff-dropdown', 'value'),
+              State('correlation-test-memory', 'data'),
+              State('information-value-memory', 'data'),
+              State('hyper-param-memory', 'data'))
+def correlationTestCallback(corr_cutoff_dropdown, corr_memory, iv_memory, hyper_param_memory):
+    corr_memory = corr_memory or {}
+    corr_memory['corr-cutoff-value'] = corr_cutoff_dropdown
+    upper_tri = pd.DataFrame(hyper_param_memory['corr_df']).rename(
+        columns={"index": "Correlation b/w"})
+    corr_cols = [{"name": i, "id": i, "type": "numeric", "format": Format(
+        precision=2, scheme=Scheme.fixed)} for i in upper_tri.columns]
+    corr_df = upper_tri.to_dict('records')
+    upper_tri = upper_tri.drop(['Correlation b/w'], axis=1)
+
+    corr_memory['Columns dropped based on correlation'] = [
+        column for column in upper_tri.columns if any(upper_tri[column] > corr_cutoff_dropdown)]
+    all_cols = upper_tri.columns
+    dropped_cols = set(iv_memory['Columns dropped based on IV']).union(
+        set(corr_memory['Columns dropped based on correlation']))
+
+    dropped_cols = pd.DataFrame(dropped_cols, index = range(1,len(dropped_cols)+1)).reset_index().rename(
+        columns={"index": "S.No", 0: 'Filtered columns'}).to_dict('records')
+    return corr_memory, corr_df, corr_cols, dropped_cols
+
+
+def interimBlrComp(interim_blr_memory):
+    try:
+        interim_BLR_results = interim_blr_memory['Interim BLR results']
+    except:
+        interim_BLR_results = None
+
+    interimBlrColumns = [{"name": i, "id": i, "type": "numeric", "format": Format(
+        precision=2, scheme=Scheme.fixed)} for i in ['index', 'coef', 'std err', 'z', 'P>|z|', '[0.025', '0.975]']]
+    return html.Div([html.Button('Update BLR results', id='blr-update-button', n_clicks=0),
+                     dash_table.DataTable(id='interim-blr-results', columns=interimBlrColumns, data=interim_BLR_results, persistence=True)])
+
+# Callback triggered when the button is clicked or Will run for the first time.
+@app.callback(Output('interim-blr-results', 'data'),
+              Output('interim-blr-memory', 'data'),
+              Input('blr-update-button', 'n_clicks'),
+              State('interim-blr-memory', 'data'),
+              State('correlation-test-memory', 'data'),
+              State('information-value-memory', 'data'),
+              State('hyper-param-memory', 'data'))
+def interimBlrCallback(n_clicks, interim_blr_memory, corr_memory, iv_memory, hyper_param_memory):
+    interim_blr_memory = interim_blr_memory or {}
+    df_train = pd.DataFrame(hyper_param_memory['train'])
+    colData = pd.DataFrame(hyper_param_memory['col_data'])
+
+    use_cols = list(set(df_train.columns) - set(iv_memory['Columns dropped based on IV']) - set(
+        corr_memory['Columns dropped based on correlation']))
+
+    df_train = df_train.loc[:, use_cols].copy()
+    formula = "y_ ~ "
+    for col in set(use_cols) - {"y_"}:
+        formula = formula + col + " + "
+    formula = formula[:-2]
+    blr_results = getBLR_Results(df_train, formula).to_dict('records')
+    interim_blr_memory['Interim BLR results'] = blr_results
+    return interim_blr_memory['Interim BLR results'], interim_blr_memory
+
+def multiCollinearityComp(multi_coll_memory):
+    try:
+        options = multi_coll_memory['options']
+        value = multi_coll_memory['value']
+    except:
+        options = []
+        value = []
+    return html.Div([html.Div([html.H5("Select the variables to test for multi collinearity "),
+                              dcc.Checklist(id="column-checklist",
+                                            options=options,
+                                            value=value,
+                                            labelStyle={'display': 'block'},
+                                            persistence=True)
+                              ], className="six columns",
+                                 style=sideColStyle),
+                    html.Div([html.H5("Unselect the column with highest VIF repeatedly untill multi collinearity drops below 10"),
+                              dash_table.DataTable(id='vif-table',
+                                                   columns=[{"name": i, "id": i, "type": "numeric", "format": Format(precision=2, scheme=Scheme.fixed)} for i in ['Column name', 'VIF']],
+                                                   data=None)
+                            ], className="six columns"),
+                    ], className="row")
+
+# Callback triggered when the checklist is changed.
+@app.callback(Output('column-checklist', 'options'),
+              Output('column-checklist', 'value'),
+              Output('vif-table', 'data'),
+              Output('multi-coll-memory', 'data'),
+              Input('column-checklist', 'value'),
+              State('multi-coll-memory', 'data'),
+              State('correlation-test-memory', 'data'),
+              State('information-value-memory', 'data'),
+              State('hyper-param-memory', 'data'))
+def multiCollinearityCallback(check_list_val, multi_coll_memory, corr_memory, iv_memory, hyper_param_memory):
+    df_train = pd.DataFrame(hyper_param_memory['train'])
+    colData = pd.DataFrame(hyper_param_memory['col_data'])
+    all_num_cols = colData.loc[colData["Data type"] == "Numerical data type", "column name"].values
+    use_cols = list(set(all_num_cols) - set(iv_memory['Columns dropped based on IV']) - set(corr_memory['Columns dropped based on correlation']) - {"y_"})
+    check_list_val = list(set(check_list_val) - set(iv_memory['Columns dropped based on IV']) - set(corr_memory['Columns dropped based on correlation']))
+
+    df_train = df_train.loc[:, use_cols]
+    check_list_opt = [{'label': i, 'value': i} for i in use_cols]
+
+    multi_coll_memory            = multi_coll_memory or {}
+    multi_coll_memory['options'] = check_list_opt
+    multi_coll_memory['value']   = check_list_val
+
+    try:
+        df_vif = get_vif(df_train, check_list_val)
+        df_vif = df_vif.sort_values(by="VIF", ascending=False)
+    except:
+        df_vif = pd.DataFrame()
+    multi_coll_memory['Columns dropped based on multi collinearity'] = list(set(use_cols) - set(check_list_val))
+    return check_list_opt, check_list_val, df_vif.to_dict('records'), multi_coll_memory
+
+
+def finalBlrComp(final_blr_memory):
+    try:
+        final_BLR_results = final_blr_memory['final BLR results']
+    except:
+        final_BLR_results = None
+
+    finalBlrColumns = [{"name": i, "id": i, "type": "numeric", "format": Format(
+        precision=2, scheme=Scheme.fixed)} for i in ['index', 'coef', 'std err', 'z', 'P>|z|', '[0.025', '0.975]']]
+    return html.Div([html.Button('Update BLR results',
+                                 id='final-blr-update-button',
+                                 n_clicks=0),
+                     dash_table.DataTable(id='final-blr-results',
+                                          columns=finalBlrColumns,
+                                          data=final_BLR_results,
+                                          persistence=True)
+                    ])
+
+
+@app.callback(Output('final-blr-results', 'data'),
+              Output('final-blr-memory', 'data'),
+              Input('final-blr-update-button', 'n_clicks'),
+              State('final-blr-memory', 'data'),
+              State('multi-coll-memory', 'data'),
+              State('correlation-test-memory', 'data'),
+              State('information-value-memory', 'data'),
+              State('hyper-param-memory', 'data'))
+def finalBlrCallback(n_clicks, final_blr_memory, multi_coll_memory, corr_memory, iv_memory, hyper_param_memory):
+    # If final_blr_memory is empty then it is instantiated with empty dictionary
+    final_blr_memory = final_blr_memory or {}
+    df_train = pd.DataFrame(hyper_param_memory['train'])
+    colData = pd.DataFrame(hyper_param_memory['col_data'])
+    # Dropping columns which doesnot satisfy IV and Correlation criteria.
+    use_cols = list(set(df_train.columns) - set(iv_memory['Columns dropped based on IV']) - set(corr_memory['Columns dropped based on correlation']) - set(multi_coll_memory['Columns dropped based on multi collinearity']))
+    df_train = df_train.loc[:, use_cols]
+    formula = "y_ ~ "
+    for col in set(use_cols) - {"y_"}:
+        formula = formula + col + " + "
+    formula = formula[:-2]
+    blr_results = getBLR_Results(df_train, formula).to_dict('records')
+    final_blr_memory['final BLR results'] = blr_results
+    return final_blr_memory['final BLR results'], final_blr_memory
+
+
+def crossValComp(cross_val_memory):
+    try:
+        cv_results = cross_val_memory['cv_results']
+    except:
+        cv_results = None
+    return html.Div([
+        html.Button('Run AutoML', id='auto-ml-button', n_clicks=0),
+        dash_table.DataTable(id='cross-validation-results',
+                             style_cell={'overflow': 'hidden','textOverflow': 'ellipsis','maxWidth': 0,},
+                             columns=[{"name": i, "id": i, "type": "numeric", "format": Format(precision=2, scheme=Scheme.fixed)} for i in ['Algorithm', 'mean_fit_time', 'mean_test_AUC', 'mean_test_Precision', 'mean_test_Recall', 'mean_test_F1 Score', 'mean_test_Accuracy', 'params']],
+                             data=cv_results,
+                             sort_action='native',
+                             filter_action='native')
+    ])
+
+
+@app.callback(Output('cross-val-memory', 'data'),
+              Output('cross-validation-results', 'data'),
+              Input('auto-ml-button', 'n_clicks'),
+              State('hyper-param-memory', 'data'),
+              State('multi-coll-memory', 'data'),
+              State('correlation-test-memory', 'data'),
+              State('information-value-memory', 'data'),
+              State('cross-val-memory', 'data')
+              )
+def crossValCallback(n_clicks, hyper_param_memory, multi_coll_memory, corr_memory, iv_memory, cross_val_memory):
+    df_train = pd.DataFrame(hyper_param_memory['train'])
+    df_test = pd.DataFrame(hyper_param_memory['test'])
+    df_column_data = pd.DataFrame(hyper_param_memory['col_data'])
+    all_cols = df_train.columns
+    iv_drop_cols = iv_memory['Columns dropped based on IV']
+    corr_drop_cols       = corr_memory['Columns dropped based on correlation']
+    multi_coll_drop_cols = multi_coll_memory['Columns dropped based on multi collinearity']
+    use_cols = list(set(all_cols) - set(iv_drop_cols) -set(corr_drop_cols) - set(multi_coll_drop_cols))
+    df_column_data = df_column_data.loc[df_column_data["column name"].isin(use_cols), :].copy()
+    
+    #Making the settings dictionary that needs to be fed into AutoML function.
+    settings_dict = {}
+    settings_dict["imp_dict"]   = df_column_data.loc[(df_column_data["InputOrTarget"] != "Target"), ["column name", "Imputation"]].set_index("column name")["Imputation"].to_dict()
+    settings_dict["ohe_cols"]   = list(df_column_data.loc[df_column_data["Encoding"] == "One hot encoding", "column name"].values)
+    settings_dict["target_col"] = df_column_data.loc[df_column_data["InputOrTarget"]== "Target", "column name"].values[0]
+    df_hyp_param = pd.DataFrame(hyper_param_memory['hyper_param_table'])
+    clfs = {}
+    
+    #Changing the hyperparameters from Table format to that understood by Grid search CV
+    for clf in df_hyp_param['Classifier'].unique():
+        temp = {}
+        for hyp in df_hyp_param.loc[df_hyp_param["Classifier"] == clf, "Actual argument"].values:
+            valus_to_try = df_hyp_param.loc[(df_hyp_param["Classifier"] == clf) & (df_hyp_param["Actual argument"] == hyp), "List of values to try"].values[0]
+            valus_to_try = ast.literal_eval(valus_to_try)
+            temp[hyp]    = valus_to_try
+        clfs[clf_lookup_dict[clf]] = temp
+    settings_dict['hyperParamDict'] = clfs
+    
+    global trained_clfs
+
+    trained_clfs, cv_results, test_results = AutoML(settings_dict, df_train, df_test)
+    cross_val_memory = {}
+    cross_val_memory['cv_results'] = cv_results.to_dict('records')
+    cross_val_memory['test_results'] = test_results.to_dict('records')
+    #cross_val_memory['trained_clfs']= trained_clfs
+    #cross_val_memory['trained_clfs'] = trained_clfs
+    #print("****************************************************")
+    #logging.info(cross_val_memory)
+    #type(trained_clfs)
+    #trained_clfs = json.dumps(trained_clfs)
+    #type(trained_clfs) 
+    #cross_val_memory = json.dumps(cross_val_memory)
+    return cross_val_memory, cv_results.to_dict('records')
+
+def testMetricsComp(cross_val_memory):
+    return html.Div([dcc.Dropdown(id='algo-select-dropdown',
+                                  options=[{'label': algo, 'value': algo} for algo in clf_lookup_dict.keys()],
+                                  value=list(clf_lookup_dict.keys())[0]
+                                 ),
+                    "Select the cut off for drawing Confusion matrix",
+                    dcc.Slider(id="slider-cutoff",
+                               min=0,
+                               max=1,
+                               step=0.01,
+                               marks={round(i, 2): str(round(i, 2)) for i in np.arange(0, 1, 0.1)},
+                               persistence=True),
+                    dash_table.DataTable(id=f"confusion-matrix",
+                                         columns=[{"name": i, "id": i, "type": "numeric", "format": Format(precision=2, scheme=Scheme.fixed)} for i in ['Confusion matrix', 'predicted 0', 'predicted 1']],
+                                         data=None
+                                        ),
+                    dash_table.DataTable(id=f"classification-report",
+                                         columns=[{"name": i, "id": i, "type": "numeric", "format": Format(precision=2, scheme=Scheme.fixed)} for i in ['Class', 'precision', 'recall','f1-score']],
+                                         data=None),
+        
+                    dbc.Row([html.Div(id="ROC-curve"),
+                            daq.Gauge(id = "ROC_AUC",
+                                      label="Area under ROC curve",
+                                      value=0,
+                                      min=0,
+                                      max=1,
+                                      color={"gradient":True,"ranges": {"green":[0.8,1.0],"yellow":[0.6,0.8],"red":[0,0.6]}},
+                                      showCurrentValue=True,
+                                     )
+                            ], justify="center", align="center"),
+
+                    html.Button('Download this model', id='download-model', n_clicks=0),
+                    html.Div(id = "model-download-container")
+                    ])
+
+@app.callback(Output("confusion-matrix", 'data'),
+              Output("ROC-curve", 'children'),
+              Output("ROC_AUC", 'value'),
+              Output("classification-report",'data'),
+              Input("algo-select-dropdown", 'value'),
+              Input("slider-cutoff", 'value'),
+              State('hyper-param-memory', 'data'),
+              State("cross-val-memory", 'data'))
+def testMetricsCallback(algo, cutoff, hyper_param_memory, cross_val_memory):
+    
+    #df_train = hyper_param_memory['train']
+    col_data = pd.DataFrame(hyper_param_memory['col_data'])
+    inp_list = []
+    df_test_results = pd.DataFrame(cross_val_memory['test_results'])
+    #trained_clfs = pkl.loads(cross_val_memory['trained_clfs'])
+    y_act = df_test_results['y_act']
+    y_pred_proba = df_test_results[algo]
+    y_pred = np.where(y_pred_proba > cutoff, 1, 0)
+    df_test_results[algo+"_y_pred_"+str(cutoff)] = y_pred
+    path1 = os.getcwd()
+    df_test_results.to_csv(path1+"\\Output\\df_test_results_" + algo + "_cutoff_" + str(cutoff) +"_" + str(datetime.now().strftime("%d-%m-%Y_%H_%M_%S")) + ".csv")
+    fpr, tpr, thresholds = roc_curve(y_act, y_pred_proba, pos_label=1)
+    report = classification_report(y_act, y_pred, labels=[0,1], output_dict=True)
+    roc_auc = roc_auc_score(y_act, y_pred_proba)
+    df_report = pd.DataFrame(report).transpose().loc[:,["precision","recall","f1-score"]].reset_index().rename(columns = {'index':'Class'})
+    ROC_curve = dcc.Graph(
+        figure={
+            'data': [
+                {'x': fpr, 'y': tpr, 'type': 'line',
+                 'name': 'Model curve'},
+                {'x': [0, 1], 'y': [0, 1], 'type': 'line',
+                 'name': 'Random curve'},
+                {'x': [0, 0, 1], 'y': [0, 1, 1],
+                    'type': 'line', 'name': 'Ideal curve'},
+            ],
+            'layout': {
+                'title': 'ROC curve'
+            }
+        }
+    )
+    conf_matrix = confusion_matrix(y_act, y_pred)
+    conf_matrix = pd.DataFrame(conf_matrix, index=['actual 0', 'actual 1'], columns=['predicted 0', 'predicted 1']).reset_index()
+    conf_matrix = conf_matrix.rename(columns={'index': 'Confusion matrix'})
+    return conf_matrix.to_dict('records'), ROC_curve, roc_auc, df_report.to_dict('records')
+
+    
+@app.callback(Output("model-download-container", 'data'),
+              Input("download-model", 'n_clicks'),
+              State("algo-select-dropdown", 'value'),
+              prevent_initial_call=True 
+              )
+def modelDownloadCallback(n_clicks,algo):
+    global trained_clfs
+    if n_clicks is not None and n_clicks > 0:
+        #logging.info(trained_clfs)
+        #print("In Download Callback")
+        #print(algo)
+        # model = list(trained_clfs.values())
+        # with open('FullModel', 'wb') as files:
+        #      pkl.dump(model, files)
+            
+        #for mod in trained_clfs.keys():
+        if algo in trained_clfs:
+            model1 = trained_clfs[algo]
+            #print(model1)
+            with open(algo, 'wb') as files:
+                pkl.dump(model1, files)
+            
+            #print(trained_clfs[algo])
+            return dcc.send_file(algo)
+        else:
+            return "Model not found" 
+    else:
+        return None   
+
+
+tabsDict = {'File Viewer': 'file-viewer',
+            'Hyper parameters': 'hyper-param',
+            'Information value': 'information-value',
+            'Correlation test': 'correlation-test',
+            'interim BLR': 'interim-blr',
+            'Multi collinearity': 'multi-collinearity',
+            'Final BLR': 'final-blr',
+            'Cross validation': 'cross-val',
+            'Test data metrics': 'test-metrics'}
+
+app.layout = html.Div([
+    dcc.Store(id='file-viewer-memory', storage_type='memory'),
+    dcc.Store(id='hyper-param-memory', storage_type='memory'),
+    dcc.Store(id='correlation-test-memory', storage_type='memory'),
+    dcc.Store(id='information-value-memory', storage_type='memory'),
+    dcc.Store(id='interim-blr-memory', storage_type='memory'),
+    dcc.Store(id='multi-coll-memory', storage_type='memory'),
+    dcc.Store(id='final-blr-memory', storage_type='memory'),
+    dcc.Store(id='cross-val-memory', storage_type='memory'),
+    dcc.Tabs(id='tabs-example', value='file-viewer', children=[dcc.Tab(
+        label=x, value=tabsDict[x], style=tab_style, selected_style=tab_selected_style) for x in tabsDict], style=tabs_styles, persistence=True),
+    html.Div(id='tabs-example-content')
+])
+
+# Call back triggered on selection of a tab
+@app.callback(Output('tabs-example-content', 'children'),
+              Input('tabs-example', 'value'),
+              State('file-viewer-memory', 'data'),
+              State('hyper-param-memory', 'data'),
+              State('correlation-test-memory', 'data'),
+              State('information-value-memory', 'data'),
+              State('interim-blr-memory', 'data'),
+              State('multi-coll-memory', 'data'),
+              State('final-blr-memory', 'data'),
+              State('cross-val-memory', 'data'))
+def tabSelector(tab, file_viewer_memory, hyper_param_memory, correlation_test_memory, information_value_memory, interim_blr_memory, multicollinearity_memory, final_blr_memory, cross_val_memory):
+    if tab == 'file-viewer':
+        return fileViewerComp()
+    elif tab == 'hyper-param':
+        return hyperParamComp()
+    elif tab == 'information-value':
+        return ivComp()
+    elif tab == 'correlation-test':
+        return corrComp()
+    elif tab == 'interim-blr':
+        return interimBlrComp(interim_blr_memory)
+    elif tab == 'multi-collinearity':
+        return multiCollinearityComp(multicollinearity_memory)
+    elif tab == 'final-blr':
+        return finalBlrComp(final_blr_memory)
+    elif tab == 'cross-val':
+        return crossValComp(cross_val_memory)
+    elif tab == 'test-metrics':
+        return testMetricsComp(cross_val_memory)
+    else:
+        return "This tab is not implemented"
+
+if __name__ == "__main__":
+    app.run_server(host='0.0.0.0', port='9015', debug=True)
+################################################################
+AutoML.py
+
+import pandas as pd
+import numpy as np
+import os
+from datetime import datetime, date, time, timezone
+import sys
+import pickle as pkl
+from Hyperparameter import *
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, FunctionTransformer
+from sklearn.model_selection import GridSearchCV 
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.decomposition import PCA
+from sklearn.metrics import confusion_matrix
+import json
+import logging
+logging.basicConfig(filename="logfile2.log", level=logging.INFO)
+
+def AutoML(settings_dict, df_train, df_test = None):
+    # settings_dict = {
+    #                 'imp_dict': {'Income_': 'mean', 'Gender_': 'mode', 'Age_': 'mean', 'WorkingYears_': 'mean', 'Education_': 'mode', 'Location_': 'mode', 'FunctionOfIncomeAndAge_': 'mean', 'BureauScore_': 'mean'},
+    #                 'ohe_cols': ['Gender_', 'Education_', 'Location_'], 'target_col': 'y_', 
+    #                 'hyperParamDict': {AdaBoostClassifier(): {'clf__learning_rate': [0.01, 0.1], 'clf__n_estimators': [100, 150]}, GradientBoostingClassifier(): {'clf__learning_rate': [0.01], 'clf__n_estimators': [50, 75, 100], 'clf__max_depth': [2, 3], 'clf__min_samples_split': [2], 'clf__min_samples_leaf': [2]}, RandomForestClassifier(): {'clf__n_estimators': [100], 'clf__criterion': ['gini'], 'clf__min_samples_split': [2], 'clf__min_samples_leaf': [2]}, BalancedRandomForestClassifier(n_jobs=-1): {'clf__n_estimators': [100], 'clf__criterion': ['gini'], 'clf__min_samples_split': [2], 'clf__min_samples_leaf': [2]}, KNeighborsClassifier(n_jobs=-1): {'clf__n_neighbors': [5], 'clf__weights': ['distance']}, SVC(probability=True): {'clf__C': [100], 'clf__tol': [0.005], 'clf__kernel': ['sigmoid']}, LogisticRegression(multi_class='multinomial', solver='newton-cg'): {'clf__C': [2000], 'clf__tol': [0.0001]}}
+    # }
+
+
+    imp_dict = settings_dict['imp_dict']
+    ohe_cols = settings_dict['ohe_cols']
+    target_col = settings_dict['target_col']
+    clfs = settings_dict['hyperParamDict']
+    
+    imp_dict = pd.Series(imp_dict)
+
+    blankFillWithMean_features = list(imp_dict.loc[imp_dict == "mean"].index)
+    blankFillWithMedian_features = list(imp_dict.loc[imp_dict == "median"].index)
+    blankFillWithMode_features = list(imp_dict.loc[imp_dict == "mode"].index)
+    blankIsBlank_features = list(imp_dict.loc[imp_dict == "BLANK"].index)
+    blankIsZero_features = list(imp_dict.loc[imp_dict == 0].index)
+
+    imputation_list_num =   [('blankIsZero', SimpleImputer(missing_values=np.nan, strategy='constant', fill_value = 0), blankIsZero_features),
+                             ('blankFillWithMean', SimpleImputer(missing_values=np.nan, strategy='mean'), blankFillWithMean_features),
+                             ('blankFillWithMedian', SimpleImputer(missing_values=np.nan, strategy='median'), blankFillWithMedian_features)]
+
+    imputation_list_cat =   [('blankIsBlank', SimpleImputer(missing_values=np.nan, strategy='constant', fill_value = 'blank'), blankIsBlank_features),
+                             ('blankFillWithMode', SimpleImputer(missing_values=np.nan, strategy='most_frequent'), blankFillWithMode_features),
+                           ]
+
+    numeric_features = []
+    for x in imputation_list_num:
+        for y in (x[2]):
+            numeric_features.append(y)
+
+    categorical_features = []
+    for x in imputation_list_cat:
+        for y in (x[2]):
+            categorical_features.append(y)
+
+
+    imp_num = ColumnTransformer(imputation_list_num,remainder='drop')
+    imp_cat = ColumnTransformer(imputation_list_cat,remainder='drop')
+
+    numeric_transformer = Pipeline(steps = [('imp_num', imp_num),
+                                #('reconstructionToPandasDataFrame1', pandasDataFrameReconstruction(columns= numericalCols)),
+                                ('scaler', StandardScaler())
+                               ])
+
+    categorical_transformer = Pipeline(steps = [('imp_cat', imp_cat),
+                                #('reconstructionToPandasDataFrame2', pandasDataFrameReconstruction(columns= catCols)),
+                                ('ohe',OneHotEncoder(handle_unknown='ignore'))
+                               ])
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numeric_transformer, numeric_features),
+            ('cat', categorical_transformer, categorical_features),
+            ],
+        remainder='drop')
+
+
+    #df_train = pd.read_csv("./inputFile.csv")    
+    X_train = df_train.drop([target_col], axis =1)
+    y_train = df_train.loc[:,target_col]
+    
+    if df_test is not None:
+        test_results = pd.DataFrame()
+        test_results["y_act"] = df_test.loc[:,target_col]
+        
+    #trained_clfs = []
+    trained_clfs = {}
+    #trained_clfs_dict = {}
+    cv_results = pd.DataFrame()
+    
+    for clf, param_grid in clfs.items():
+        pipe = Pipeline(steps=[('preprocessor', preprocessor),
+                               ('clf', clf)])
+        search = GridSearchCV(pipe, param_grid, n_jobs=-1, scoring = {'AUC': 'roc_auc', 'Precision': 'precision','Recall':'recall','F1 Score':'f1','Accuracy':'accuracy'}, refit = 'AUC')
+        search.fit(X_train, y_train)
+        
+        
+        #with open('model_pkl2', 'wb') as files:
+            #pkl.dump(model, files)
+            
+        temp_df = pd.DataFrame(search.cv_results_)
+        temp_df["Algorithm"] = inv_clf_lookup_dict[clf]
+        temp_df['params'] = temp_df['params'].astype('str')
+        #trained_clfs.append(search)
+        trained_clfs[inv_clf_lookup_dict[clf]] = search
+        cv_results = pd.concat([cv_results, temp_df], axis = 0)
+        
+        #logging.info(temp_df["Algorithm"]
+        if df_test is not None:
+            X_test = df_test.drop([target_col], axis =1)
+            y_pred = search.best_estimator_.predict_proba(X_test)
+            y_pred = pd.DataFrame(y_pred)[1]
+            test_results[inv_clf_lookup_dict[clf]] = y_pred
+    
+    #logging.info(trained_clfs)
+    #trained_clfs = json.dumps(trained_clfs)
+    #with open('model_pkl2', 'wb') as files:
+            #pkl.dump(trained_clfs, files)
+    
+    #for i in range(0, len(trained_clfs)):
+        #trained_clfs_dict[i] = trained_clfs[i]
+    #print(trained_clfs_dict) 
+    return trained_clfs, cv_results, test_results
+
+###################################################
+funcs.py
+
+import base64
+import datetime
+import io
+
+import dash
+from dash.dependencies import Input, Output, State
+import dash_core_components as dcc
+import dash_html_components as html
+import dash_table
+import numpy as np
+import statsmodels.api as sm
+import pandas as pd
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+import statsmodels.formula.api as smf
+from statsmodels.stats.outliers_influence import variance_inflation_factor as vif
+
+
+external_stylesheets = ['https://codepen.io/chriddyp/pen/bWLwgP.css']
+
+
+def parse_contents(contents, filename):
+    content_type, content_string = contents.split(',')
+
+    decoded = base64.b64decode(content_string)
+    try:
+        if 'csv' in filename:
+            # Assume that the user uploaded a CSV file
+            df = pd.read_csv(
+                io.StringIO(decoded.decode('utf-8')))
+        elif 'xls' in filename:
+            # Assume that the user uploaded an excel file
+            df = pd.read_excel(io.BytesIO(decoded))
+    except Exception as e:
+        df = pd.DataFrame()
+    return df
+
+
+def printToFile(text):
+    f = open("demofile3.txt", "a")
+    f.write(text+"\n")
+    f.close()
+
+def calculate_woe_iv(dataset, feature, target):
+    lst = []
+    for i in range(dataset[feature].nunique()):
+        val = list(dataset[feature].unique())[i]
+        lst.append({
+            'Value': val,
+            'All': dataset[dataset[feature] == val].count()[feature],
+            'Good': dataset[(dataset[feature] == val) & (dataset[target] == 0)].count()[feature],
+            'Bad': dataset[(dataset[feature] == val) & (dataset[target] == 1)].count()[feature]
+        })
+        
+    dset = pd.DataFrame(lst)
+    dset['Distr_Good'] = dset['Good'] / dset['Good'].sum()
+    dset['Distr_Bad'] = dset['Bad'] / dset['Bad'].sum()
+    dset['WoE'] = np.log(dset['Distr_Good'] / dset['Distr_Bad'])
+    dset = dset.replace({'WoE': {np.inf: 0, -np.inf: 0}})
+    dset['IV'] = (dset['Distr_Good'] - dset['Distr_Bad']) * dset['WoE']
+    iv = dset['IV'].sum()
+    
+    dset = dset.sort_values(by='WoE')
+    
+    return dset, iv
+
+def getBLR_Results(df, formula):
+    log_reg = smf.glm(formula = formula, data = df, family=sm.families.Binomial()).fit()
+    summary_df = pd.read_html(log_reg.summary().tables[1].as_html(), header=0, index_col=0)[0]
+    summary_df = summary_df.reset_index()
+    return summary_df
+
+def get_vif(df, cols):
+    df = df.loc[:,cols]
+    vif_data = pd.DataFrame()
+    vif_data["Column name"] = cols
+
+    vif_data["VIF"] = [vif(df.values, i) for i in range(len(cols))]
+    return vif_data
+###################################
+
+Hyperparameter.py
+
+
+from sklearn.ensemble import RandomForestClassifier, IsolationForest, BaggingClassifier
+from sklearn.linear_model import LogisticRegression
+from imblearn.ensemble import BalancedRandomForestClassifier, EasyEnsembleClassifier
+from sklearn.ensemble import AdaBoostClassifier
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
+
+clf_lookup_dict = {
+    'Ada Boost':AdaBoostClassifier(),
+    'Gradient Boost':GradientBoostingClassifier(),
+    'Random Forest' : RandomForestClassifier(),
+    'Balanced Random Forest' :BalancedRandomForestClassifier(n_jobs=-1),
+    'K Neighbor classifier':KNeighborsClassifier(n_jobs=-1),
+    'Support vector classifier':SVC(probability=True),
+    'Logistic Regression':LogisticRegression(solver='newton-cg', multi_class='multinomial')
+    }
+
+inv_clf_lookup_dict = {v: k for k, v in clf_lookup_dict.items()}
+
+
+HyperParameters = [{'Classifier': 'Ada Boost',
+  'Hyper parameter': 'learning rate',
+  'List of values to try': '[0.01,0.1]',
+  'Actual argument': 'clf__learning_rate',
+  'Actual classifier function': 'AdaBoost'},
+                   
+  {'Classifier': 'Ada Boost',
+   'Hyper parameter': 'Number of estimators',
+   'List of values to try': '[100,150]',
+   'Actual argument': 'clf__n_estimators',
+   'Actual classifier function': 'AdaBoost'},
+  {'Classifier': 'Gradient Boost',
+   'Hyper parameter': 'learning rate',
+   'List of values to try': '[0.01]',
+   'Actual argument': 'clf__learning_rate',
+   'Actual classifier function': 'GradientBoosting'},
+  {'Classifier': 'Gradient Boost',
+   'Hyper parameter': 'Number of estimators',
+   'List of values to try': '[50,75,100]',
+   'Actual argument': 'clf__n_estimators',
+   'Actual classifier function': 'GradientBoosting'},
+  {'Classifier': 'Gradient Boost',
+   'Hyper parameter': 'Max depth',
+   'List of values to try': '[2,3]',
+   'Actual argument': 'clf__max_depth',
+   'Actual classifier function': 'GradientBoosting'},
+  {'Classifier': 'Gradient Boost',
+   'Hyper parameter': 'Min sample split',
+   'List of values to try': '[2]',
+   'Actual argument': 'clf__min_samples_split',
+   'Actual classifier function': 'GradientBoosting'},
+  {'Classifier': 'Gradient Boost',
+   'Hyper parameter': 'Min sample leaf',
+   'List of values to try': '[2]',
+   'Actual argument': 'clf__min_samples_leaf',
+   'Actual classifier function': 'GradientBoosting'},
+  {'Classifier': 'Random Forest',
+   'Hyper parameter': 'Number of estimators',
+   'List of values to try': '[100]',
+   'Actual argument': 'clf__n_estimators',
+   'Actual classifier function': 'RandomForest'},
+  {'Classifier': 'Random Forest',
+   'Hyper parameter': 'Criterion',
+   'List of values to try': "['gini']",
+   'Actual argument': 'clf__criterion',
+   'Actual classifier function': 'RandomForest'},
+  {'Classifier': 'Random Forest',
+   'Hyper parameter': 'Min sample split',
+   'List of values to try': '[2]',
+   'Actual argument': 'clf__min_samples_split',
+   'Actual classifier function': 'RandomForest'},
+  {'Classifier': 'Random Forest',
+   'Hyper parameter': 'Min sample leaf',
+   'List of values to try': '[2]',
+   'Actual argument': 'clf__min_samples_leaf',
+   'Actual classifier function': 'RandomForest'},
+  {'Classifier': 'Balanced Random Forest',
+   'Hyper parameter': 'Number of estimators',
+   'List of values to try': '[100]',
+   'Actual argument': 'clf__n_estimators',
+   'Actual classifier function': 'BalancedRandomForest'},
+  {'Classifier': 'Balanced Random Forest',
+   'Hyper parameter': 'Criterion',
+   'List of values to try': "['gini']",
+   'Actual argument': 'clf__criterion',
+   'Actual classifier function': 'BalancedRandomForest'},
+  {'Classifier': 'Balanced Random Forest',
+   'Hyper parameter': 'Min sample split',
+   'List of values to try': '[2]',
+   'Actual argument': 'clf__min_samples_split',
+   'Actual classifier function': 'BalancedRandomForest'},
+  {'Classifier': 'Balanced Random Forest',
+   'Hyper parameter': 'Min sample leaf',
+   'List of values to try': '[2]',
+   'Actual argument': 'clf__min_samples_leaf',
+   'Actual classifier function': 'BalancedRandomForest'},
+  {'Classifier': 'K Neighbor classifier',
+   'Hyper parameter': 'Number of neighbour',
+   'List of values to try': '[5]',
+   'Actual argument': 'clf__n_neighbors',
+   'Actual classifier function': 'KNeighbors'},
+  {'Classifier': 'K Neighbor classifier',
+   'Hyper parameter': 'weights',
+   'List of values to try': "['distance']",
+   'Actual argument': 'clf__weights',
+   'Actual classifier function': 'KNeighbors'},
+  {'Classifier': 'Support vector classifier',
+   'Hyper parameter': 'C',
+   'List of values to try': '[100]',
+   'Actual argument': 'clf__C',
+   'Actual classifier function': 'SVC'},
+  {'Classifier': 'Support vector classifier',
+   'Hyper parameter': 'Tolerance',
+   'List of values to try': '[0.005]',
+   'Actual argument': 'clf__tol',
+   'Actual classifier function': 'SVC'},
+  {'Classifier': 'Support vector classifier',
+   'Hyper parameter': 'Kernel',
+   'List of values to try': "['sigmoid']",
+   'Actual argument': 'clf__kernel',
+   'Actual classifier function': 'SVC'},
+  {'Classifier': 'Logistic Regression',
+   'Hyper parameter': 'C',
+   'List of values to try': '[2000]',
+   'Actual argument': 'clf__C',
+   'Actual classifier function': 'LogisticRegression'},
+  {'Classifier': 'Logistic Regression',
+   'Hyper parameter': 'Tolerance',
+   'List of values to try': '[0.0001]',
+   'Actual argument': 'clf__tol',
+   'Actual classifier function': 'LogisticRegression'}]
+###########################################################################
+
+style.py
+
+style_data_conditional=[
+        {
+            'if': {
+                'column_id': ['InputOrTarget', 'Imputation', 'List of values to try','Encoding'],
+            },
+            'backgroundColor': '#2CA02C',
+            'color': 'white'
+        }
+  ]
+
+tabs_styles = {
+    'height': '44px'
+}
+tab_style = {
+    'borderBottom': '1px solid #d6d6d6',
+    'padding': '6px',
+    'fontWeight': 'bold'
+}
+
+tab_selected_style = {
+    'borderTop': '1px solid #d6d6d6',
+    'borderBottom': '1px solid #d6d6d6',
+    'backgroundColor': '#119DFF',
+    'color': 'white',
+    'padding': '6px'
+}
+
+uploadStyle = {'width': '100%','height': '60px','lineHeight': '60px','borderWidth': '1px','borderStyle': 'dashed','borderRadius': '5px','textAlign': 'center','margin': '10px'}
+
+sideColStyle = {"width": "300px", "height": "525px",'margin': '10px','padding':'10px'}
+
+#######################################
