@@ -1,0 +1,296 @@
+import dash
+from dash import dcc
+from dash import html
+import plotly.express as px
+from dash.dependencies import Input, Output, State, ClientsideFunction
+from dash import dash_table
+import numpy as np
+import pandas as pd
+from datetime import datetime as dt
+import pathlib
+from funcs import parse_contents, printToFile, uploadStyle
+from pandas.api.types import is_numeric_dtype
+from Preprocess import Preprocess
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from dash.dash_table.Format import Format, Scheme
+
+app = dash.Dash(
+    __name__,
+    meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}],
+)
+app.title = "CRISIL clustering Dashboard"
+
+server = app.server
+app.config.suppress_callback_exceptions = True
+
+# Path
+BASE_PATH = pathlib.Path(__file__).parent.resolve()
+DATA_PATH = BASE_PATH.joinpath("data").resolve()
+
+
+
+algoList = ["K Means","Affinity Propagation","Mean Shift","Spectral Clustering","Ward","Agglomerative clustering","DBSCAN","OPTICS","BIRCH","Gaussian Mixture"]
+col_list = ["Col A","Col B","Col C","Col D","Col E","Col F","Col G","Col H","Col I"]
+
+def get_imp_and_agg(df,col):
+    if df[col].dtype in ["int64","int32"]:
+        return ("median","median","NA")
+    elif df[col].dtype in ["float64","float32"]:
+        return ("mean","mean","NA")
+    elif df[col].dtype in ["object"]:
+        return ("mode","pivot","ohe")
+    else:
+        return ("Check the datatype","Check the datatype")
+
+
+def generate_control_card():
+    return html.Div(
+        id="control-card",
+        children=[
+            dcc.Store(id="memory",storage_type='memory'),
+            dcc.Store(id="hyper-param-memory",storage_type='memory'),
+            html.P("Upload data"),
+            dcc.Upload(id='upload-data', children=html.Div(['Drag and Drop or ', html.A('Select Files')]),
+                   style=uploadStyle, multiple=False),
+            html.P("Select Algorithm"),
+            dcc.Dropdown(
+                id="algorithm-select",
+                options=[{"label": i, "value": i} for i in algoList],
+                value=None
+            ),
+            html.Br(),
+            html.P("Hyperparameters"),
+            html.Div(id="hyper-param-container"),
+            html.Br(),
+            html.P("Select Input variables"),
+            dcc.Dropdown(
+                id="input-var-select",
+                options=[],
+                multi=True,
+            ),
+            html.Br(),
+            html.P("Select Profiling variables"),
+            dcc.Dropdown(
+                id="profile-var-select",
+                options=[],
+                multi=True,
+            ),
+            
+            html.Br(),
+            html.P("Select the aggregation of profiling columns"),
+            dash_table.DataTable(
+                id='aggregation-table',
+                columns=[{"name": i, "id": i} for i in ['Col','Imp','Agg','Enc']],
+                editable = True
+            ),
+            html.Br(),
+            html.Br(),
+            html.Button('Run Clustering', id='run-clus', n_clicks=0),
+            html.Br(),
+            html.Br(),
+        ],
+    )
+@app.callback(
+    Output('hyper-param-container', 'children'),
+    Output('memory','data'),
+    Output('input-var-select','options'),
+    Output('profile-var-select','options'),
+    Output('aggregation-table','data'),
+    Input('algorithm-select', "value"),
+    Input('input-var-select','value'),
+    Input('profile-var-select','value'),
+    Input('aggregation-table','data'),
+    Input('upload-data', 'contents'),
+    State('upload-data', 'filename'),
+    State('memory','data'),
+    State('hyper-param-memory','data'))
+def update_table(algorithm_select, input_var_select, profile_var_select, agg_table, contents, filename, memory, hyper_param_memory):
+    
+    memory = memory or {}
+    try:
+        ctx = dash.callback_context.triggered[0]['prop_id']
+    except:
+        ctx = None
+    
+    # The below lines will be executed only when the call back is triggered because of file upload
+    if ctx == 'upload-data.contents':
+        if contents is not None:
+            all_data = parse_contents(contents, filename)
+        else:
+            all_data = pd.DataFrame()
+        memory['inputData'] = all_data.to_dict('records')
+        memory['columns'] = list(all_data.columns)
+        memory['input-var-options'] = list(all_data.columns)
+        memory['profile-var-options'] = list(all_data.columns)
+        agg_df = pd.DataFrame([[col,get_imp_and_agg(all_data,col)[0],get_imp_and_agg(all_data,col)[1],get_imp_and_agg(all_data,col)[2]] for col in all_data.columns]).rename(columns = {0:"Col",1:"Imp", 2:"Agg",3:"Enc"})
+        agg_table = agg_df.to_dict('records')
+        memory['agg-table'] = agg_table
+
+    
+    try:
+        all_data = pd.DataFrame(memory['inputData'])
+    except:
+        all_data = pd.DataFrame()
+        
+    try:
+        k = hyper_param_memory['k-means-number-of-clusters']
+    except:
+        k = 4
+    returnCont = "TBI"
+    if (algorithm_select == "K Means"):
+        returnCont = html.Div(children = [html.P("Number of clusters"),
+                                    dcc.Slider(
+                                        id = "k-means-number-of-clusters",
+                                        min=1,
+                                        max=15,
+                                        step=1,
+                                        marks={i: str(i) for i in range(16)},
+                                        value= k
+                                    )
+                                    ])
+        memory['returnCont'] = returnCont
+        
+    try:
+        returnCont = memory['returnCont']
+    except:
+        returnCont = None
+    
+    # The below lines will be executed only when the call back is triggered because of profile variable selection
+    if (ctx == 'profile-var-select.value'):
+        memory['profile-var-selected'] = profile_var_select
+    if (ctx == 'input-var-select.value'):
+        memory['input-var-selected'] = input_var_select
+    
+    col_options = [{"label":i,"value":i} for i in all_data.columns]
+    
+    if ctx == "aggregation-table":
+        memory['agg-table'] = agg_table
+        
+
+    return returnCont, memory, col_options, col_options , agg_table
+
+
+
+def right_comp():
+    return html.Div(
+            id="right-column",
+            className="eight columns",
+            children=[
+                dcc.Graph(id="scatter-plot"),
+                html.Div(id="profile-var-aggregation")
+            ],
+        )
+
+@app.callback(
+    Output('scatter-plot', 'figure'),
+    Output('profile-var-aggregation','children'),
+    Input('run-clus','n_clicks'),
+    State('memory','data'),
+    State('hyper-param-memory','data'))
+def run_clustering(n_clicks, memory, hyper_param_memory):
+    if n_clicks > 0 :
+        df = pd.DataFrame(memory['inputData'])
+        agg_table = pd.DataFrame(memory['agg-table'])
+        input_vars = memory['input-var-selected']
+        profile_vars = memory['profile-var-selected']
+        settings_dict = {
+                    'imp_dict': agg_table.loc[agg_table["Col"].isin(input_vars),:].set_index("Col")["Imp"].to_dict(),
+                    'agg_dict': agg_table.loc[agg_table["Col"].isin(profile_vars),:].set_index("Col")["Agg"].to_dict(),
+                    'ohe_cols': agg_table.loc[(agg_table["Col"].isin(input_vars)) & (agg_table["Enc"] != "NA"),"Enc"].values
+                    }
+        df_train = Preprocess(settings_dict, df)
+        pca = PCA(n_components=2)
+        k = hyper_param_memory['k-means-number-of-clusters']
+        clus = KMeans(n_clusters=k).fit(df_train)
+        pca2 = pca.fit_transform(df_train)
+        
+        df["Clusters"] =  clus.labels_
+        df_pca_plot = pd.DataFrame(pca2, columns = ["PCA 1","PCA 2"])
+        df_pca_plot["Cluster"] = clus.labels_
+        fig = px.scatter(df_pca_plot, x="PCA 1", y="PCA 2", color="Cluster")
+        df_prof_var_agg = pd.DataFrame(index = range(k))
+        for col in profile_vars:
+            if settings_dict['agg_dict'][col] == "mean" :
+                df_prof_var_agg[col] = df[["Clusters",col]].groupby(["Clusters"]).mean()
+            if settings_dict['agg_dict'][col] == "median" :
+                df_prof_var_agg[col] = df[["Clusters",col]].groupby(["Clusters"]).median()
+            if settings_dict['agg_dict'][col] == "mode" :
+                df_prof_var_agg[col] = df[["Clusters",col]].groupby(["Clusters"]).mode()
+            if settings_dict['agg_dict'][col] == "pivot" :
+                df_prof_var_agg[col] = pd.Series({i : str(df.loc[df["Clusters"] == i, col].value_counts().to_dict()) for i in df["Clusters"].unique()})
+        df_prof_var_agg = df_prof_var_agg.reset_index().rename(columns = {"index":"Cluster"})
+        prof_var_agg = dash_table.DataTable(
+                                id='prof-var-agg',
+                                columns=[{"name": i, "id": i, "type": "numeric", "format": Format(precision=2, scheme=Scheme.fixed)} for i in df_prof_var_agg.columns],
+                                data=df_prof_var_agg.to_dict('records'),
+                            )
+        
+        return fig, prof_var_agg
+    else:
+        return px.scatter(), None
+
+@app.callback(
+    Output('hyper-param-memory','data'),
+    Input('k-means-number-of-clusters','value'),
+    State('hyper-param-memory','data'))
+def hyperParamCallBack(k, hyper_param_memory):
+    hyper_param_memory = hyper_param_memory or {}
+    hyper_param_memory['k-means-number-of-clusters'] = k
+    return hyper_param_memory
+    
+app.layout = html.Div(
+    id="app-container",
+    children=[
+        # Left column
+        html.Div(
+            id="left-column",
+            className="four columns",
+            children=[generate_control_card()]
+            + [
+                html.Div(
+                    ["initial child"], id="output-clientside", style={"display": "none"}
+                )
+            ],
+        ),
+        # Right column
+        right_comp(),
+    ],
+)
+
+# Run the server
+if __name__ == "__main__":
+    app.run_server(debug=True)
+###################################################################################################################
+func.py
+
+
+import base64
+import io
+import pandas as pd
+
+
+
+def parse_contents(contents, filename):
+    content_type, content_string = contents.split(',')
+
+    decoded = base64.b64decode(content_string)
+    try:
+        if 'csv' in filename:
+            # Assume that the user uploaded a CSV file
+            df = pd.read_csv(
+                io.StringIO(decoded.decode('utf-8')))
+        elif 'xls' in filename:
+            # Assume that the user uploaded an excel file
+            df = pd.read_excel(io.BytesIO(decoded))
+    except Exception as e:
+        df = pd.DataFrame()
+    return df
+
+
+def printToFile(text):
+    f = open("demofile2.txt", "a")
+    f.write(text+"\n")
+    f.close()
+    
+uploadStyle = {'width': '100%','height': '60px','lineHeight': '60px','borderWidth': '1px','borderStyle': 'dashed','borderRadius': '5px','textAlign': 'center','margin': '10px'}
